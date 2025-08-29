@@ -1,0 +1,27 @@
+version: "3.8"
+services:
+  api:
+    build:
+      context: ./src/api
+      dockerfile: Dockerfile
+    image: local/football-sim-api:latest
+    restart: unless-stopped
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    environment:
+      - ARTIFACTS_DIR=/app/artifacts
+      - LOG_DIR=/app/logs
+
+  ui:
+    build:
+      context: ./src/ui
+      dockerfile: Dockerfile
+    image: local/football-sim-ui:latest
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://api:8000
