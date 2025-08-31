@@ -1,0 +1,9 @@
+# engine_patch_use_p50_p90.txt
+# Replace base_mean_and_std with:
+def base_mean_and_std(row: pd.Series) -> tuple[float, float]:
+    if "p50" in row and not pd.isna(row["p50"]):
+        mean = float(row["p50"])
+        p90  = float(row["p90"]) if "p90" in row and not pd.isna(row["p90"]) else mean + 4.0
+        std  = max((p90 - mean) / 1.2816, 1.0)
+        return mean, std
+    # fallback...

@@ -1,0 +1,263 @@
+import pandas as pd
+import streamlit as st
+import numpy as np
+from pathlib import Path
+
+# --------- Engine + Model Loader ----------
+try:
+    import simulation_engine as simeng
+except Exception as e:
+    simeng = None
+    _simeng_err = e
+
+try:
+    from model_loader import score_current_week
+    LOADER_AVAILABLE = True
+except Exception as e:
+    LOADER_AVAILABLE = False
+    _loader_err = e
+
+# --------- Page config ----------
+st.set_page_config(page_title="DFS NFL Environment-Aware Simulator", layout="wide")
+
+# --------- Small helpers ----------
+def coerce_upper_strip(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.upper().str.strip()
+
+def normalize_key_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    def pick(cands):
+        for c in cands:
+            if c in out.columns:
+                return c
+        return None
+    cols = {
+        "PLAYER": pick(["PLAYER","Player","player","player_name","full_name","Name"]),
+        "TEAM":   pick(["TEAM","Team","team","recent_team","posteam"]),
+        "OPP":    pick(["OPP","Opp","opp","opponent","defteam"]),
+        "POS":    pick(["POS","Position","pos","player_position"]),
+        "SAL":    pick(["SAL","Salary","salary","dk_salary"]),
+        "RST%":   pick(["RST%","OWN","Ownership","ProjOwn","Projected Ownership"])
+    }
+    # standardize core columns
+    for std, src in cols.items():
+        if src is None:
+            out[std] = ""
+        else:
+            if std in ("PLAYER","TEAM","OPP","POS"):
+                out[std] = coerce_upper_strip(out[src])
+            elif std in ("SAL","RST%"):
+                out[std] = pd.to_numeric(out[src], errors="coerce")
+            else:
+                out[std] = out[src]
+    return out
+
+def run_simulation_with_best_effort(df: pd.DataFrame, num_sims: int = 10000, seed: int = 42):
+    if simeng is None:
+        st.error(f"Simulation engine import failed: {_simeng_err}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    # Try modern signature first (num_sims, seed); fall back to legacy (sims_per_matchup)
+    try:
+        return simeng.process_uploaded_file(df, num_sims=num_sims, seed=seed)
+    except TypeError:
+        try:
+            return simeng.process_uploaded_file(df, num_sims)
+        except Exception as e:
+            st.error(f"An error occurred during simulation: {e}")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    except Exception as e:
+        st.error(f"An error occurred during simulation: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+def compute_final_gpp_table(players_inputs: pd.DataFrame, sim_table: pd.DataFrame | None) -> pd.DataFrame:
+    pi = players_inputs.copy()
+    pi = normalize_key_cols(pi)
+
+    df_offense = pi[pi["POS"] != "DST"]
+    df_dst = pi[pi["POS"] == "DST"].copy()
+    # DST quick values from uploaded FPTS if present
+    if "FPTS" in df_dst.columns:
+        df_dst["PLAYER"] = df_dst["TEAM"] + " DST"
+        df_dst["MED_final"] = df_dst["FPTS"]
+        df_dst["FPTS_p90"] = df_dst["FPTS"]
+        df_dst["FPTS_mean"] = df_dst["FPTS"]
+        df_dst["SCORE_gpp"] = df_dst["FPTS"]
+        df_dst["CSV_MED"] = df_dst["FPTS"]
+        df_dst["Mean_Val"] = (df_dst["FPTS"] / (df_dst["SAL"] / 1000.0)).fillna(0)
+        df_dst["Ceiling_Val"] = df_dst["Mean_Val"]
+
+    simtab = (sim_table.copy() if sim_table is not None else pd.DataFrame())
+    if not simtab.empty:
+        simtab = normalize_key_cols(simtab)
+
+    merged = df_offense.merge(
+        simtab,
+        on=["PLAYER", "TEAM", "POS", "OPP"],
+        how="left",
+        suffixes=("", "_sim"),
+    )
+
+    # ensure expected new columns exist
+    new_sim_cols = [
+        "FPTS_p50",
+        "FPTS_p90",
+        "FPTS_mean",
+        "Boom_Pct_4x",
+        "Bust_Pct_2x",
+        "Sim_Team_Total",
+        "Sim_Game_OU",
+        "Sim_Game_Spread",
+    ]
+    for c in new_sim_cols:
+        if c not in merged.columns:
+            merged[c] = np.nan
+
+    # CSV median vs model median
+    merged["CSV_MED"] = pd.to_numeric(merged.get("FPTS", np.nan), errors="coerce")
+    sim_med = merged["FPTS_p50"]
+    merged["SIM_MED"] = sim_med.where(sim_med.notna(), merged["CSV_MED"])
+
+    # blend (heavily weight the model median)
+    w_sim = 0.95
+    merged["MED_final"] = w_sim * merged["SIM_MED"] + (1.0 - w_sim) * merged["CSV_MED"]
+
+    # ceiling / leverage bits
+    p90 = merged["FPTS_p90"]
+    up = p90 - merged["MED_final"]
+    up[up < 0] = 0.0
+    merged["UP"] = up
+
+    merged["OWN"] = pd.to_numeric(merged.get("RST%", 0), errors="coerce").fillna(0.0) / 100.0
+    k_up, k_lev = 0.5, 0.5
+    merged["LEV"] = (merged["MED_final"] - merged["CSV_MED"]) * (1.0 - merged["OWN"])
+    merged["SCORE_gpp"] = merged["MED_final"] + k_up * merged["UP"] + k_lev * merged["LEV"]
+
+    final_df = pd.concat([merged, df_dst], ignore_index=True)
+    return final_df.sort_values("SCORE_gpp", ascending=False, na_position="last").reset_index(drop=True)
+
+# --------- UI helpers (health/alerts, nicer tables) ----------
+def health_panel(scored_df: pd.DataFrame, models_dir: str, aux_dir: str):
+    ok = []
+    warn = []
+
+    # models present?
+    have = [p for p in ["QB", "RB", "WR", "TE"] if Path(models_dir, f"lgbm_{p}.pkl").exists()]
+    if len(have) == 4:
+        ok.append("All model bundles found (QB/RB/WR/TE).")
+    else:
+        missing = ", ".join(sorted(set(["QB","RB","WR","TE"]) - set(have)))
+        warn.append(f"Missing model bundles for: {missing}")
+
+    # optional engineered data
+    missing = [
+        n for n in ["player_usage.parquet", "team_context.parquet", "defense_adjust.parquet"]
+        if not Path(aux_dir, n).exists()
+    ]
+    if missing:
+        warn.append("Optional data not found: " + ", ".join(missing))
+    else:
+        ok.append("Optional data present (usage/context/defense).")
+
+    # p50/p90 coverage
+    if "p50" in scored_df.columns and "p90" in scored_df.columns:
+        frac = float(np.mean(~pd.isna(scored_df["p50"])))
+        if frac < 0.90:
+            warn.append(f"Only {frac:.0%} of rows have p50/p90. Check POS mapping or features.")
+        else:
+            ok.append(f"{frac:.0%} of rows scored with p50/p90.")
+    else:
+        warn.append("Model predictions (p50/p90) not present after scoring.")
+
+    with st.expander("Health & Alerts", expanded=True):
+        for m in ok: st.success(m)
+        for m in warn: st.warning(m)
+
+def display_table(df_to_show: pd.DataFrame, title: str):
+    st.subheader(title)
+    if df_to_show is None or df_to_show.empty:
+        st.info("No data to display.")
+        return
+    # nice formatting
+    num_fmt = {
+        "FPTS_mean":"{:.2f}","FPTS_p50":"{:.2f}","FPTS_p90":"{:.2f}",
+        "Boom_Pct_4x":"{:.1%}","Bust_Pct_2x":"{:.1%}",
+        "Ceiling_Val":"{:.2f}","Mean_Val":"{:.2f}",
+        "MED_final":"{:.2f}","SCORE_gpp":"{:.2f}",
+        "Sim_Team_Total":"{:.1f}","Sim_Game_OU":"{:.1f}","Sim_Game_Spread":"{:.1f}",
+        "OWN":"{:.1%}"
+    }
+    style_cols = {c: num_fmt[c] for c in num_fmt if c in df_to_show.columns}
+    st.dataframe(df_to_show.style.format(style_cols), use_container_width=True, height=520)
+
+# ============================ UI ============================
+st.title("DFS NFL Environment-Aware Simulator")
+st.caption("Upload → Score with models → Simulate with OU anchoring, correlation, and joint stacks.")
+
+with st.sidebar:
+    st.header("Run Controls")
+    MODELS_DIR = st.text_input("Models directory", value=r"C:\Users\stuff\nfl_export\models")
+    AUX_DIR    = st.text_input("Aux data directory (optional)", value=r"C:\Users\stuff\nfl_export\data_2022_2024")
+    sims = st.number_input("Monte Carlo simulations", min_value=1000, max_value=50000, step=1000, value=10000)
+    seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, step=1, value=42)
+    fast = st.toggle("Fast mode (2,000 sims)", value=False)
+    if fast:
+        sims = 2000
+
+st.markdown("**Step 1 — Upload weekly player CSV**")
+uploaded = st.file_uploader("Upload players.csv", type=["csv"])
+
+if uploaded is None:
+    st.info("Upload a weekly CSV to begin.")
+    st.stop()
+
+# Step 1: Read + normalize
+try:
+    raw = pd.read_csv(uploaded)
+    base_df = normalize_key_cols(raw)
+    st.success(f"Loaded {len(base_df)} rows from CSV.")
+except Exception as e:
+    st.error(f"Could not read CSV: {e}")
+    st.stop()
+
+# Step 2: Score with models (if available)
+st.markdown("**Step 2 — Score with quantile models (p10/p50/p90)**")
+if not LOADER_AVAILABLE:
+    st.warning(f"Model loader not available: {_loader_err}. Proceeding without model scoring.")
+    scored_df = base_df
+else:
+    try:
+        scored_df = score_current_week(base_df, models_dir=MODELS_DIR, aux_data_dir=AUX_DIR)
+        st.success("Scored with models (p10/p50/p90 added).")
+    except Exception as e:
+        st.error(f"Model scoring error: {e}")
+        scored_df = base_df
+
+# Health & Alerts panel (models present, optional data present, coverage, etc.)
+health_panel(scored_df, MODELS_DIR, AUX_DIR)
+
+# Step 3: Simulate
+st.markdown("**Step 3 — Run simulation**")
+player_table, dst_table, gamestack_table = run_simulation_with_best_effort(scored_df, num_sims=int(sims), seed=int(seed))
+st.success("Simulation complete.")
+
+# Display stacks
+st.subheader("Top Game Stacks (by joint p90)")
+if gamestack_table is None or gamestack_table.empty:
+    st.warning("No game stack data was generated.")
+else:
+    show_cols = gamestack_table.copy()
+    for col in ["Stack_Mean_FPTS", "Stack_P90_FPTS", "P90_Value"]:
+        if col in show_cols.columns:
+            show_cols[col] = show_cols[col].round(2)
+    st.dataframe(show_cols.head(50), use_container_width=True, height=400)
+
+# Final player view with GPP score
+final_tbl = compute_final_gpp_table(scored_df, player_table if not player_table.empty else None)
+
+tabs = st.tabs(["All", "QB", "RB", "WR", "TE", "DST"])
+with tabs[0]: display_table(final_tbl, "All Players")
+with tabs[1]: display_table(final_tbl[final_tbl["POS"] == "QB"], "QB")
+with tabs[2]: display_table(final_tbl[final_tbl["POS"].str.contains("RB", na=False)], "RB")
+with tabs[3]: display_table(final_tbl[final_tbl["POS"].str.contains("WR", na=False)], "WR")
+with tabs[4]: display_table(final_tbl[final_tbl["POS"].str.contains("TE", na=False)], "TE")
+with tabs[5]: display_table(final_tbl[final_tbl["POS"] == "DST"], "DST")

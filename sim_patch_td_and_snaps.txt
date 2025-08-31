@@ -1,0 +1,17 @@
+# sim_patch_td_and_snaps.txt
+def simulate_snap_share_beta(baseline: float, injury_tag: str, sims: int, rng) -> np.ndarray:
+    b = float(np.clip(baseline if baseline is not None else 0.75, 0.10, 0.95))
+    inj = (str(injury_tag).upper() if injury_tag is not None else "")
+    conc = 80.0
+    if inj in ("Q","D","DNP","O","OUT","LP"):
+        conc = 30.0
+    a = b * conc + 1e-3; c = (1.0 - b) * conc + 1e-3
+    draws = rng.beta(a, c, sims).astype(np.float64)
+    return np.clip(draws / b, 0.5, 1.5)
+
+def td_tail_injection(team_total: float, td_share: float, sims: int, rng) -> np.ndarray:
+    if team_total is None or team_total <= 0 or td_share is None or td_share <= 0:
+        return np.zeros(sims, dtype=np.float64)
+    lam = float(team_total) / 7.0 * float(np.clip(td_share, 0.0, 1.0))
+    td = rng.poisson(lam, sims).astype(np.float64)
+    return 0.5 * 6.0 * (td - lam)
